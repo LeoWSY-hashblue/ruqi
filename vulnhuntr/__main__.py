@@ -90,10 +90,16 @@ class CodeDefinitions(BaseXmlModel, tag="context_code"):
     definitions: List[CodeDefinition] = []
 
 class RepoOps:
+    EXCLUDE_DIRS = {
+        'tests', 'test', 'docs', 'doc',
+        'dist', 'build', '.venv', 'venv',
+        'virtualenv', 'env', '.tox',
+        '.pytest_cache', 'node_modules', '__pycache__'
+    }
+    EXCLUDE_FILE_NAMES = {'setup.py', 'conftest.py'}
+
     def __init__(self, repo_path: Path | str ) -> None:
         self.repo_path = Path(repo_path)
-        self.to_exclude = {'/setup.py', '/test', '/example', '/docs', '/site-packages', '.venv', 'virtualenv', '/dist'}
-        self.file_names_to_exclude = ['test_', 'conftest', '_test.py']
 
         patterns = [
             #Async
@@ -235,21 +241,18 @@ class RepoOps:
         return
 
     def get_relevant_py_files(self) -> Generator[Path, None, None]:
-        """Gets all Python files in a repo minus the ones in the exclude list (test, example, doc, docs)"""
+        """Gets all Python files in a repo minus explicitly excluded test and build paths."""
         files = []
         for f in self.repo_path.rglob("*.py"):
-            # Convert the path to a string with forward slashes
-            f_str = str(f).replace('\\', '/')
-            
-            # Lowercase the string for case-insensitive matching
-            f_str = f_str.lower()
-
-            # Check if any exclusion pattern matches a substring of the full path
-            if any(exclude in f_str for exclude in self.to_exclude):
+            rel_parts = {part.lower() for part in f.relative_to(self.repo_path).parts[:-1]}
+            if self.EXCLUDE_DIRS & rel_parts:
                 continue
 
-            # Check if the file name should be excluded
-            if any(fn in f.name for fn in self.file_names_to_exclude):
+            file_name = f.name.lower()
+            if file_name in self.EXCLUDE_FILE_NAMES:
+                continue
+
+            if file_name.startswith('test_') or file_name.endswith('_test.py'):
                 continue
             
             files.append(f)

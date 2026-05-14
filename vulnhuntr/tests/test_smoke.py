@@ -115,6 +115,79 @@ def test_network_pattern_filter(make_repo):
     }
 
 
+def test_path_filter_excludes_tests_dir(make_repo):
+    repo_root = make_repo(
+        {
+            "app.py": '''
+                def app_main():
+                    return "keep"
+            ''',
+            "tests/routes.py": '''
+                def should_be_excluded():
+                    return "skip"
+            ''',
+        }
+    )
+
+    repo = main_mod.RepoOps(repo_root)
+
+    assert {path.relative_to(repo_root).as_posix() for path in repo.get_relevant_py_files()} == {"app.py"}
+
+
+
+def test_path_filter_keeps_examples_dir(make_repo):
+    repo_root = make_repo(
+        {
+            "examples/demo.py": '''
+                from flask import Flask
+
+                app = Flask(__name__)
+            ''',
+            "app.py": '''
+                def app_main():
+                    return "keep"
+            ''',
+        }
+    )
+
+    repo = main_mod.RepoOps(repo_root)
+    kept = {path.relative_to(repo_root).as_posix() for path in repo.get_relevant_py_files()}
+
+    assert "examples/demo.py" in kept
+    assert "app.py" in kept
+
+
+
+def test_path_filter_excludes_conftest(make_repo):
+    repo_root = make_repo(
+        {
+            "conftest.py": '''
+                def pytest_configure():
+                    return None
+            ''',
+            "app.py": '''
+                def app_main():
+                    return "keep"
+            ''',
+        }
+    )
+
+    repo = main_mod.RepoOps(repo_root)
+
+    assert {path.relative_to(repo_root).as_posix() for path in repo.get_relevant_py_files()} == {"app.py"}
+
+
+
+def test_path_filter_keeps_test_named_substring(tmp_path_factory):
+    repo_root = tmp_path_factory.mktemp("testbed") / "repo"
+    repo_root.mkdir()
+    (repo_root / "app.py").write_text("def app_main():\n    return 'keep'\n", encoding="utf-8")
+
+    repo = main_mod.RepoOps(repo_root)
+
+    assert {path.relative_to(repo_root).as_posix() for path in repo.get_relevant_py_files()} == {"app.py"}
+
+
 def test_symbol_extractor_basic(make_repo):
     repo_root = make_repo(
         {
