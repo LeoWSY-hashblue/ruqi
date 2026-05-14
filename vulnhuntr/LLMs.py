@@ -1,11 +1,19 @@
 import logging
 from typing import List, Union, Dict, Any
 from pydantic import BaseModel, ValidationError
-import anthropic
 import os
-import openai
 import dotenv
 import requests
+
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+
+try:
+    import openai
+except ImportError:
+    openai = None
 
 dotenv.load_dotenv()
 
@@ -77,6 +85,8 @@ class LLM:
 class Claude(LLM):
     def __init__(self, model: str, base_url: str, system_prompt: str = "") -> None:
         super().__init__(system_prompt)
+        if anthropic is None:
+            raise LLMError("anthropic package is required to use the Claude client")
         # API key is retrieved from an environment variable by default
         self.client = anthropic.Anthropic(max_retries=3, base_url=base_url)
         self.model = model
@@ -113,6 +123,8 @@ class Claude(LLM):
 class ChatGPT(LLM):
     def __init__(self, model: str, base_url: str, system_prompt: str = "") -> None:
         super().__init__(system_prompt)
+        if openai is None:
+            raise LLMError("openai package is required to use the ChatGPT client")
         self.client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"), base_url=base_url)
         self.model = model
 
