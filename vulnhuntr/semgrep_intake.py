@@ -10,10 +10,15 @@ from vulnhuntr.candidate import Candidate
 from vulnhuntr.candidate import SinkType
 
 SEMGREP_RULE_TO_SINK: dict[str, SinkType] = {
+    # RCE sinks
     'python.lang.security.audit.eval-detected.eval-detected': 'rce',
     'python.lang.security.audit.exec-detected.exec-detected': 'rce',
     'python.lang.security.audit.subprocess-shell-true.subprocess-shell-true': 'rce',
+    # SQLi sinks
     'python.lang.security.audit.formatted-sql-query.formatted-sql-query': 'sqli',
+    # Added after flask-admin first run: text() with f-string is a SQLi pattern
+    'python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text': 'sqli',
+    # SSRF sinks
     'python.requests.security.disabled-cert-validation.disabled-cert-validation': 'ssrf',
 }
 
@@ -63,7 +68,7 @@ def _run_semgrep_command(repo_path: Path) -> subprocess.CompletedProcess[str]:
     env['SEMGREP_SETTINGS_FILE'] = str(semgrep_home / 'settings.yml')
 
     return subprocess.run(
-        ['semgrep', '--config=p/security-audit', '--json', '--quiet'],
+        ['semgrep', '--config=p/python', '--json', '--quiet'],
         cwd=repo_path,
         capture_output=True,
         text=True,
