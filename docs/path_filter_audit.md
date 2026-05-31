@@ -91,3 +91,73 @@ After replacing the substring path filter with repo-relative directory-part matc
 | `flask_admin/tests/sqla/conftest.py` | no | yes | yes | `sqlalchemy` | `dir:tests`, `file:conftest.py` |
 | `flask_admin/tests/sqla/test_basic.py` | no | yes | no | `sqlalchemy` | `dir:tests`, `pattern:test_*.py` |
 | `flask_admin/tests/sqla/test_translation.py` | no | yes | no | `sqlalchemy` | `dir:tests`, `pattern:test_*.py` |
+
+
+## Examples Breakdown
+
+`flask-admin/examples/` contains 52 Python files. Under the original audit predicate, 10 of them are "suspicious" and 42 are not.
+
+| Relative path | Suspicious | route decorator | request param | web import | sink keywords |
+| - | - | - | - | - | - |
+| `examples/__init__.py` | no | no | no | no | `-` |
+| `examples/auth/__init__.py` | no | no | no | no | `-` |
+| `examples/auth/data.py` | no | no | no | no | `-` |
+| `examples/auth/main.py` | yes | yes | no | yes | `sqlalchemy` |
+| `examples/auth_flask_login/__init__.py` | no | no | no | no | `-` |
+| `examples/auth_flask_login/main.py` | yes | yes | no | yes | `sqlalchemy` |
+| `examples/azure_blob_storage/__init__.py` | no | no | no | no | `-` |
+| `examples/azure_blob_storage/main.py` | no | no | no | yes | `-` |
+| `examples/babel/__init__.py` | no | no | no | no | `-` |
+| `examples/babel/main.py` | yes | yes | no | yes | `sqlalchemy` |
+| `examples/bootstrap4/__init__.py` | no | no | no | no | `-` |
+| `examples/bootstrap4/data.py` | no | no | no | no | `-` |
+| `examples/bootstrap4/main.py` | yes | yes | no | yes | `sqlalchemy` |
+| `examples/csp_nonce/__init__.py` | no | no | no | no | `-` |
+| `examples/csp_nonce/main.py` | no | yes | no | yes | `-` |
+| `examples/custom_layout/__init__.py` | no | no | no | no | `-` |
+| `examples/custom_layout/data.py` | no | no | no | no | `-` |
+| `examples/custom_layout/main.py` | yes | yes | no | yes | `sqlalchemy` |
+| `examples/datetime_timezone/__init__.py` | no | no | no | no | `-` |
+| `examples/datetime_timezone/main.py` | yes | yes | no | yes | `sqlalchemy` |
+| `examples/forms_files_images/__init__.py` | no | no | no | no | `-` |
+| `examples/forms_files_images/data.py` | no | no | no | no | `-` |
+| `examples/forms_files_images/main.py` | yes | yes | no | yes | `sqlalchemy` |
+| `examples/geo_alchemy/__init__.py` | no | no | no | no | `-` |
+| `examples/geo_alchemy/main.py` | yes | no | no | yes | `sqlalchemy` |
+| `examples/host_matching/__init__.py` | no | no | no | no | `-` |
+| `examples/host_matching/main.py` | no | yes | no | yes | `-` |
+| `examples/methodview/__init__.py` | no | no | no | no | `-` |
+| `examples/methodview/main.py` | no | yes | no | yes | `-` |
+| `examples/mongoengine/main.py` | no | yes | no | yes | `-` |
+| `examples/multiple_admin_instances/__init__.py` | no | no | no | no | `-` |
+| `examples/multiple_admin_instances/main.py` | no | yes | no | yes | `-` |
+| `examples/peewee_simple/__init__.py` | no | no | no | no | `-` |
+| `examples/peewee_simple/main.py` | no | yes | no | yes | `-` |
+| `examples/pymongo_simple/__init__.py` | no | no | no | no | `-` |
+| `examples/pymongo_simple/main.py` | no | yes | no | yes | `-` |
+| `examples/rediscli/__init__.py` | no | no | no | no | `-` |
+| `examples/rediscli/main.py` | no | yes | no | yes | `-` |
+| `examples/s3/__init__.py` | no | no | no | no | `-` |
+| `examples/s3/main.py` | no | yes | no | yes | `-` |
+| `examples/simple/__init__.py` | no | no | no | no | `-` |
+| `examples/simple/main.py` | no | yes | no | yes | `-` |
+| `examples/sqla/__init__.py` | no | no | no | no | `-` |
+| `examples/sqla/admin/__init__.py` | no | no | no | yes | `-` |
+| `examples/sqla/admin/data.py` | no | no | no | no | `-` |
+| `examples/sqla/admin/main.py` | no | yes | no | yes | `-` |
+| `examples/sqla/admin/models.py` | no | no | no | no | `sqlalchemy` |
+| `examples/sqla/main.py` | no | no | no | no | `-` |
+| `examples/sqla_association_proxy/__init__.py` | no | no | no | no | `-` |
+| `examples/sqla_association_proxy/main.py` | yes | yes | no | yes | `sqlalchemy` |
+| `examples/sqla_custom_inline_forms/__init__.py` | no | no | no | no | `-` |
+| `examples/sqla_custom_inline_forms/main.py` | yes | yes | no | yes | `sqlalchemy` |
+
+### What the 42 non-suspicious files mostly are
+
+Most of the non-suspicious files fall into a few predictable buckets: package markers (`__init__.py`), static seed/data modules, demo apps with routes but no tracked sink keyword, and ORM/model definition files that import `sqlalchemy` but do not expose request handlers.
+
+- `examples/auth/data.py`: Static seed data only: lists of first and last names, no framework imports, no routes, no sink keywords.
+- `examples/azure_blob_storage/main.py`: Executable demo app with Flask imports and app startup, but its storage setup uses Azure clients rather than the sink keywords tracked by this audit.
+- `examples/simple/main.py`: Real Flask routes and app.run(), but no tracked sink keyword such as subprocess/eval/exec/os.system/sqlalchemy/requests.get.
+- `examples/sqla/admin/models.py`: SQLAlchemy model declarations and helpers only; it hits the sink keyword scan via sqlalchemy imports, but has no route decorators or request-bearing handlers.
+- `examples/rediscli/main.py`: Flask route plus Redis test-container wiring, but none of the sink keywords used by the current audit heuristic.

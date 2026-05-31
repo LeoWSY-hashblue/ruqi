@@ -1,12 +1,13 @@
 import json
 import re
 import argparse
+import time
 import structlog
 from vulnhuntr.symbol_finder import SymbolExtractor
 from vulnhuntr.LLMs import Claude, ChatGPT, Ollama
 from vulnhuntr.prompts import *
 from rich import print
-from typing import List, Generator
+from typing import List, Generator, Optional
 from enum import Enum
 from pathlib import Path
 from pydantic_xml import BaseXmlModel, element
@@ -30,6 +31,10 @@ faulthandler.enable()
 
 log = structlog.get_logger("vulnhuntr")
 
+MAX_SECONDARY_ROUNDS = 10
+MAX_CONTEXT_TOKENS_PER_FILE = 40_000   # rough estimate: len(source) // 4
+MAX_WALL_SECONDS_PER_FILE = 180
+
 class VulnType(str, Enum):
     LFI = "LFI"
     RCE = "RCE"
@@ -51,6 +56,7 @@ class Response(BaseModel):
     confidence_score: int = Field(description="0-10, where 0 is no confidence and 10 is absolute certainty because you have the entire user input to server output code path.")
     vulnerability_types: List[VulnType] = Field(description="The types of identified vulnerabilities")
     context_code: List[ContextCode] = Field(description="List of context code items requested for analysis, one function or class name per item. No standard library or third-party package code.")
+    abort_reason: Optional[str] = Field(default=None, description="Orchestrator-set field — do not populate. Hard limit that ended the secondary loop: 'max_rounds', 'token_budget', or 'wall_time'.")
 
 class ReadmeContent(BaseXmlModel, tag="readme_content"):
     content: str
@@ -320,12 +326,139 @@ def print_readable(report: Response) -> None:
         print('-' * 40)
         print()  # Add an empty line between attributes
 
+SINK_TYPE_TO_VULN_TYPE = {
+    "rce": VulnType.RCE,
+    "ssrf": VulnType.SSRF,
+    "sqli": VulnType.SQLI,
+    "path_traversal": VulnType.LFI,  # closest match in existing prompt set
+}
+
+
+def _get_semgrep_candidates(repo_path: Path) -> list:
+    from vulnhuntr.semgrep_intake import run_semgrep  # lazy to avoid circular import
+    return run_semgrep(repo_path)
+
+
+def _run_secondary_loop(
+    vuln_type: VulnType,
+    py_f: Path,
+    content: str,
+    initial_definitions: 'CodeDefinitions',
+    initial_stored: dict,
+    llm,
+    code_extractor,
+    files,
+    args,
+) -> 'Response | None':
+    """
+    Vuln-specific secondary analysis loop with three hard-limit guards:
+    MAX_SECONDARY_ROUNDS, MAX_CONTEXT_TOKENS_PER_FILE, MAX_WALL_SECONDS_PER_FILE.
+    Sets abort_reason on the returned Response when a hard limit fires.
+    """
+    stored_code_definitions = dict(initial_stored)
+    definitions = initial_definitions
+    previous_analysis = ''
+    previous_context_amount = 0
+    same_context = False
+    secondary_analysis_report = None
+    loop_start = time.monotonic()
+
+    for i in range(MAX_SECONDARY_ROUNDS):
+        log.info("Performing vuln-specific analysis", iteration=i, vuln_type=str(vuln_type), file=str(py_f))
+
+        if i > 0:
+            previous_context_amount = len(stored_code_definitions)
+            previous_analysis = secondary_analysis_report.analysis
+
+            for context_item in secondary_analysis_report.context_code:
+                if context_item.name not in stored_code_definitions:
+                    match = code_extractor.extract(context_item.name, context_item.code_line, files)
+                    if match:
+                        stored_code_definitions[context_item.name] = match
+
+            # Hard limit: accumulated context token estimate
+            total_context_tokens = sum(len(d['source']) for d in stored_code_definitions.values()) // 4
+            if total_context_tokens > MAX_CONTEXT_TOKENS_PER_FILE:
+                secondary_analysis_report.abort_reason = "token_budget"
+                log.info("Secondary loop abort", reason="token_budget", tokens=total_context_tokens, file=str(py_f))
+                print_readable(secondary_analysis_report)
+                return secondary_analysis_report
+
+            # Hard limit: wall-clock time
+            if time.monotonic() - loop_start > MAX_WALL_SECONDS_PER_FILE:
+                secondary_analysis_report.abort_reason = "wall_time"
+                log.info("Secondary loop abort", reason="wall_time", file=str(py_f))
+                print_readable(secondary_analysis_report)
+                return secondary_analysis_report
+
+            code_definitions = list(stored_code_definitions.values())
+            definitions = CodeDefinitions(definitions=code_definitions)
+
+            if args.verbosity > 1:
+                for definition in definitions.definitions:
+                    if '\n' in definition.source:
+                        lines = definition.source.split('\n')
+                        snippet = lines[0] + '\n' + lines[1]
+                    else:
+                        snippet = definition.source[:75]
+                    print(f"Name: {definition.name}")
+                    print(f"Context search: {definition.context_name_requested}")
+                    print(f"File Path: {definition.file_path}")
+                    print(f"First two lines from source: {snippet}\n")
+
+        vuln_specific_user_prompt = (
+            FileCode(file_path=str(py_f), file_source=content).to_xml() + b'\n' +
+            definitions.to_xml() + b'\n' +
+            ExampleBypasses(
+                example_bypasses='\n'.join(VULN_SPECIFIC_BYPASSES_AND_PROMPTS[vuln_type]['bypasses'])
+            ).to_xml() + b'\n' +
+            Instructions(instructions=VULN_SPECIFIC_BYPASSES_AND_PROMPTS[vuln_type]['prompt']).to_xml() + b'\n' +
+            AnalysisApproach(analysis_approach=ANALYSIS_APPROACH_TEMPLATE).to_xml() + b'\n' +
+            PreviousAnalysis(previous_analysis=previous_analysis).to_xml() + b'\n' +
+            Guidelines(guidelines=GUIDELINES_TEMPLATE).to_xml() + b'\n' +
+            ResponseFormat(
+                response_format=json.dumps(Response.model_json_schema(), indent=4)
+            ).to_xml()
+        ).decode()
+
+        secondary_analysis_report = llm.chat(vuln_specific_user_prompt, response_model=Response)
+        log.info("Secondary analysis complete", secondary_analysis_report=secondary_analysis_report.model_dump())
+
+        if args.verbosity > 0:
+            print_readable(secondary_analysis_report)
+
+        if not len(secondary_analysis_report.context_code):
+            log.debug("No new context functions or classes found")
+            if args.verbosity == 0:
+                print_readable(secondary_analysis_report)
+            return secondary_analysis_report
+
+        # Check if any new context code is requested
+        if previous_context_amount >= len(stored_code_definitions) and i > 0:
+            if same_context:
+                log.debug("No new context functions or classes requested")
+                if args.verbosity == 0:
+                    print_readable(secondary_analysis_report)
+                return secondary_analysis_report
+            same_context = True
+            log.debug("No new context functions or classes requested")
+    else:
+        # Hard limit: MAX_SECONDARY_ROUNDS exhausted (no break/return fired)
+        if secondary_analysis_report is not None:
+            secondary_analysis_report.abort_reason = "max_rounds"
+            log.info("Secondary loop abort", reason="max_rounds", file=str(py_f))
+            print_readable(secondary_analysis_report)
+
+    return secondary_analysis_report
+
+
 def run():
     parser = argparse.ArgumentParser(description='Analyze a GitHub project for vulnerabilities. Export your ANTHROPIC_API_KEY/OPENAI_API_KEY before running.')
     parser.add_argument('-r', '--root', type=str, required=True, help='Path to the root directory of the project')
     parser.add_argument('-a', '--analyze', type=str, help='Specific path or file within the project to analyze')
     parser.add_argument('-l', '--llm', type=str, choices=['claude', 'gpt', 'ollama'], default='claude', help='LLM client to use (default: claude)')
     parser.add_argument('-v', '--verbosity', action='count', default=0, help='Increase output verbosity (-v for INFO, -vv for DEBUG)')
+    parser.add_argument('--semgrep', action='store_true', default=False, help='Use Semgrep candidates as analysis seeds instead of full-file initial scan')
     args = parser.parse_args()
 
     repo = RepoOps(args.root)
@@ -333,21 +466,17 @@ def run():
     # Get repo files that don't include stuff like tests and documentation
     files = repo.get_relevant_py_files()
 
-    # User specified --analyze flag
-    if args.analyze:
-        # Determine the path to analyze
-        analyze_path = Path(args.analyze)
-
-        # If the path is absolute, use it as is, otherwise join it with the root path so user can specify relative paths
-        if analyze_path.is_absolute():
-            files_to_analyze = repo.get_files_to_analyze(analyze_path)
+    if not args.semgrep:
+        # User specified --analyze flag
+        if args.analyze:
+            analyze_path = Path(args.analyze)
+            if analyze_path.is_absolute():
+                files_to_analyze = repo.get_files_to_analyze(analyze_path)
+            else:
+                files_to_analyze = repo.get_files_to_analyze(Path(args.root) / analyze_path)
         else:
-            files_to_analyze = repo.get_files_to_analyze(Path(args.root) / analyze_path)
+            files_to_analyze = repo.get_network_related_files(files)
 
-    # Analyze the entire project for network-related files
-    else:
-        files_to_analyze = repo.get_network_related_files(files)
-    
     llm = initialize_llm(args.llm)
 
     readme_content = repo.get_readme_content()
@@ -363,130 +492,86 @@ def run():
     else:
         log.warning("No README summary found")
         summary = ''
-    
-    # Initialize the system prompt with the README summary
+
     system_prompt = (Instructions(instructions=SYS_PROMPT_TEMPLATE).to_xml() + b'\n' +
                 ReadmeSummary(readme_summary=summary).to_xml()
                 ).decode()
-    
+
     llm = initialize_llm(args.llm, system_prompt)
 
-    # files_to_analyze is either a list of all network-related files or a list containing a single file/dir to analyze
-    for py_f in files_to_analyze:
-        log.info(f"Performing initial analysis", file=str(py_f))
-
-        # This is the Initial analysis
-        with py_f.open(encoding='utf-8') as f:
-            content = f.read()
-            if not len(content):
+    if args.semgrep:
+        # Semgrep-guided flow: skip initial full-file scan, seed secondary loop from Candidate context
+        candidates = _get_semgrep_candidates(Path(args.root))
+        for candidate in candidates:
+            vuln_type = SINK_TYPE_TO_VULN_TYPE.get(candidate.sink_type)
+            if vuln_type is None:
+                log.warning("Unknown sink type, skipping candidate", sink_type=candidate.sink_type)
                 continue
 
-            print(f"\nAnalyzing {py_f}")
-            print('-' * 40 +'\n')
+            py_f = Path(args.root) / candidate.file
+            try:
+                content = py_f.read_text(encoding='utf-8')
+            except OSError:
+                log.warning("Cannot read candidate file", file=str(py_f))
+                continue
 
-            user_prompt =(
+            log.info("Processing semgrep candidate", file=candidate.file, line=candidate.line, sink_type=candidate.sink_type)
+            print(f"\nSemgrep candidate: {candidate.file}:{candidate.line} [{candidate.sink_type}]")
+            print('-' * 40 + '\n')
+
+            # Seed context from Candidate's enclosing function/class
+            initial_stored = {}
+            if candidate.enclosing_source and candidate.enclosing_symbol:
+                initial_stored[candidate.enclosing_symbol] = {
+                    "name": candidate.enclosing_symbol,
+                    "context_name_requested": candidate.enclosing_symbol,
+                    "file_path": candidate.file,
+                    "source": candidate.enclosing_source,
+                }
+
+            initial_definitions = CodeDefinitions(definitions=[
+                CodeDefinition(**d) for d in initial_stored.values()
+            ])
+
+            _run_secondary_loop(
+                vuln_type, py_f, content, initial_definitions, initial_stored,
+                llm, code_extractor, files, args,
+            )
+
+    else:
+        # Original flow: initial full-file analysis → secondary loop per vuln type
+        for py_f in files_to_analyze:
+            log.info("Performing initial analysis", file=str(py_f))
+
+            with py_f.open(encoding='utf-8') as f:
+                content = f.read()
+                if not len(content):
+                    continue
+
+                print(f"\nAnalyzing {py_f}")
+                print('-' * 40 + '\n')
+
+                user_prompt = (
                     FileCode(file_path=str(py_f), file_source=content).to_xml() + b'\n' +
                     Instructions(instructions=INITIAL_ANALYSIS_PROMPT_TEMPLATE).to_xml() + b'\n' +
                     AnalysisApproach(analysis_approach=ANALYSIS_APPROACH_TEMPLATE).to_xml() + b'\n' +
                     PreviousAnalysis(previous_analysis='').to_xml() + b'\n' +
                     Guidelines(guidelines=GUIDELINES_TEMPLATE).to_xml() + b'\n' +
-                    ResponseFormat(response_format=json.dumps(Response.model_json_schema(), indent=4
-                    )
-                ).to_xml()
-            ).decode()
+                    ResponseFormat(response_format=json.dumps(Response.model_json_schema(), indent=4)).to_xml()
+                ).decode()
 
-            initial_analysis_report: Response = llm.chat(user_prompt, response_model=Response)
-            log.info("Initial analysis complete", report=initial_analysis_report.model_dump())
+                initial_analysis_report: Response = llm.chat(user_prompt, response_model=Response)
+                log.info("Initial analysis complete", report=initial_analysis_report.model_dump())
 
-            print_readable(initial_analysis_report)
+                print_readable(initial_analysis_report)
 
-            # Secondary analysis
-            if initial_analysis_report.confidence_score > 0 and len(initial_analysis_report.vulnerability_types):
-
-                for vuln_type in initial_analysis_report.vulnerability_types:
-
-                    # Do not fetch the context code on the first pass of the secondary analysis because the context will be from the general analysis
-                    stored_code_definitions = {}
-                    definitions = CodeDefinitions(definitions=[])
-                    same_context = False
-
-                    # Don't include the initial analysis or the first iteration of the secondary analysis in the user_prompt
-                    previous_analysis = ''
-                    previous_context_amount = 0
-
-                    for i in range(7):
-                        log.info(f"Performing vuln-specific analysis", iteration=i, vuln_type=vuln_type, file=py_f)
-
-                        # Only lookup context code and previous analysis on second pass and onwards
-                        if i > 0:
-                            previous_context_amount = len(stored_code_definitions)
-                            previous_analysis = secondary_analysis_report.analysis
-
-                            for context_item in secondary_analysis_report.context_code:
-                                # Make sure bot isn't requesting the same code multiple times
-                                if context_item.name not in stored_code_definitions:
-                                    name = context_item.name
-                                    code_line = context_item.code_line
-                                    match = code_extractor.extract(name, code_line, files)
-                                    if match:
-                                        stored_code_definitions[name] = match
-
-                            code_definitions = list(stored_code_definitions.values())
-                            definitions = CodeDefinitions(definitions=code_definitions)
-                            
-                            if args.verbosity > 1:
-                                for definition in definitions.definitions:
-                                    if '\n' in definition.source:
-                                        lines = definition.source.split('\n')
-                                        snippet = lines[0] + '\n' + lines[1]
-                                    else:
-                                        snippet = definition.source[:75]
-                                    
-                                    print(f"Name: {definition.name}")
-                                    print(f"Context search: {definition.context_name_requested}")
-                                    print(f"File Path: {definition.file_path}")
-                                    print(f"First two lines from source: {snippet}\n")
-
-                        vuln_specific_user_prompt = (
-                            FileCode(file_path=str(py_f), file_source=content).to_xml() + b'\n' +
-                            definitions.to_xml() + b'\n' +  # These are all the requested context functions and classes
-                            ExampleBypasses(
-                                example_bypasses='\n'.join(VULN_SPECIFIC_BYPASSES_AND_PROMPTS[vuln_type]['bypasses'])
-                            ).to_xml() + b'\n' +
-                            Instructions(instructions=VULN_SPECIFIC_BYPASSES_AND_PROMPTS[vuln_type]['prompt']).to_xml() + b'\n' +
-                            AnalysisApproach(analysis_approach=ANALYSIS_APPROACH_TEMPLATE).to_xml() + b'\n' +
-                            PreviousAnalysis(previous_analysis=previous_analysis).to_xml() + b'\n' +
-                            Guidelines(guidelines=GUIDELINES_TEMPLATE).to_xml() + b'\n' +
-                            ResponseFormat(
-                                response_format=json.dumps(
-                                    Response.model_json_schema(), indent=4
-                                )
-                            ).to_xml()
-                        ).decode()
-
-                        secondary_analysis_report: Response = llm.chat(vuln_specific_user_prompt, response_model=Response)
-                        log.info("Secondary analysis complete", secondary_analysis_report=secondary_analysis_report.model_dump())
-
-                        if args.verbosity > 0:
-                            print_readable(secondary_analysis_report)
-
-                        if not len(secondary_analysis_report.context_code):
-                            log.debug("No new context functions or classes found")
-                            if args.verbosity == 0:
-                                print_readable(secondary_analysis_report)
-                            break
-                        
-                        # Check if any new context code is requested
-                        if previous_context_amount >= len(stored_code_definitions) and i > 0:
-                            # Let it request the same context once, then on the second time it requests the same context, break
-                            if same_context:
-                                log.debug("No new context functions or classes requested")
-                                if args.verbosity == 0:
-                                    print_readable(secondary_analysis_report)
-                                break
-                            same_context = True
-                            log.debug("No new context functions or classes requested")
-                    pass
+                if initial_analysis_report.confidence_score > 0 and len(initial_analysis_report.vulnerability_types):
+                    for vuln_type in initial_analysis_report.vulnerability_types:
+                        _run_secondary_loop(
+                            vuln_type, py_f, content,
+                            CodeDefinitions(definitions=[]), {},
+                            llm, code_extractor, files, args,
+                        )
 
 if __name__ == '__main__':
     run()

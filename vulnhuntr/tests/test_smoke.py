@@ -278,6 +278,195 @@ def test_secondary_analysis_loop_terminates(make_repo, monkeypatch):
     assert len(fake_extractor.calls) == 1
 
 
+def test_secondary_loop_aborts_on_max_rounds(make_repo, monkeypatch):
+    repo_root = make_repo(
+        {
+            "README.md": "# Demo\n",
+            "app.py": '''
+                from flask import Flask
+
+                app = Flask(__name__)
+
+                @app.route("/run")
+                def run_route():
+                    return "ok"
+            ''',
+        }
+    )
+
+    call_counter = [0]
+
+    class InfiniteContextLLM:
+        def chat(self, prompt, response_model=None, max_tokens=4096):
+            if response_model is None:
+                return "<summary>test</summary>"
+            call_counter[0] += 1
+            if call_counter[0] == 1:
+                return main_mod.Response(
+                    scratchpad="i", analysis="i", poc="None",
+                    confidence_score=8, vulnerability_types=[main_mod.VulnType.RCE],
+                    context_code=[],
+                )
+            # Always request a brand-new unique symbol to bypass duplicate-context detection
+            new_name = f"UniqueFunc{call_counter[0]}"
+            return main_mod.Response(
+                scratchpad="s", analysis="s", poc="None",
+                confidence_score=8, vulnerability_types=[main_mod.VulnType.RCE],
+                context_code=[main_mod.ContextCode(name=new_name, reason="need", code_line=f"{new_name}()")],
+            )
+
+    class TrivialExtractor:
+        def extract(self, name, code_line, files):
+            return {"name": name, "context_name_requested": name,
+                    "file_path": str(files[0]), "source": "def x(): pass"}
+
+    captured = []
+    monkeypatch.setattr(main_mod, "initialize_llm", lambda *a, **kw: InfiniteContextLLM())
+    monkeypatch.setattr(main_mod, "SymbolExtractor", lambda p: TrivialExtractor())
+    monkeypatch.setattr(main_mod, "print_readable", lambda r: captured.append(r))
+    monkeypatch.setattr(sys, "argv", ["vulnhuntr", "-r", str(repo_root)])
+
+    main_mod.run()
+
+    assert any(r.abort_reason == "max_rounds" for r in captured)
+
+
+def test_secondary_loop_aborts_on_token_budget(make_repo, monkeypatch):
+    repo_root = make_repo(
+        {
+            "README.md": "# Demo\n",
+            "app.py": '''
+                from flask import Flask
+
+                app = Flask(__name__)
+
+                @app.route("/exec")
+                def exec_route():
+                    return "ok"
+            ''',
+        }
+    )
+
+    call_counter = [0]
+
+    class InfiniteContextLLM:
+        def chat(self, prompt, response_model=None, max_tokens=4096):
+            if response_model is None:
+                return "<summary>test</summary>"
+            call_counter[0] += 1
+            if call_counter[0] == 1:
+                return main_mod.Response(
+                    scratchpad="i", analysis="i", poc="None",
+                    confidence_score=8, vulnerability_types=[main_mod.VulnType.RCE],
+                    context_code=[],
+                )
+            new_name = f"UniqueFunc{call_counter[0]}"
+            return main_mod.Response(
+                scratchpad="s", analysis="s", poc="None",
+                confidence_score=8, vulnerability_types=[main_mod.VulnType.RCE],
+                context_code=[main_mod.ContextCode(name=new_name, reason="need", code_line=f"{new_name}()")],
+            )
+
+    class BigSourceExtractor:
+        # Each symbol resolves to ~10 001 tokens (40 004 chars); four fetches exceed the 40 000-token cap
+        def extract(self, name, code_line, files):
+            return {"name": name, "context_name_requested": name,
+                    "file_path": str(files[0]), "source": "x" * 40_004}
+
+    captured = []
+    monkeypatch.setattr(main_mod, "initialize_llm", lambda *a, **kw: InfiniteContextLLM())
+    monkeypatch.setattr(main_mod, "SymbolExtractor", lambda p: BigSourceExtractor())
+    monkeypatch.setattr(main_mod, "print_readable", lambda r: captured.append(r))
+    monkeypatch.setattr(sys, "argv", ["vulnhuntr", "-r", str(repo_root)])
+
+    main_mod.run()
+
+    assert any(r.abort_reason == "token_budget" for r in captured)
+
+
+def test_semgrep_flag_routes_to_candidate_context(make_repo, monkeypatch):
+    repo_root = make_repo({"app.py": "def target():\n    eval(data)\n"})
+
+    from vulnhuntr.candidate import Candidate
+
+    fake_candidate = Candidate(
+        file="app.py",
+        line=2,
+        sink_type="rce",
+        semgrep_rule_id="python.lang.security.audit.eval-detected.eval-detected",
+        code_snippet="eval(data)",
+        enclosing_symbol="target",
+        # Distinctive marker that proves this string comes from the Candidate, not FileCode
+        enclosing_source="SEMGREP_SEEDED_CONTEXT: def target():\n    eval(data)\n",
+    )
+
+    captured_prompts = []
+
+    class PromptCaptureLLM:
+        def chat(self, prompt, response_model=None, max_tokens=4096):
+            captured_prompts.append(prompt)
+            if response_model is None:
+                return "<summary>test</summary>"
+            return main_mod.Response(
+                scratchpad="s", analysis="s", poc="None",
+                confidence_score=5, vulnerability_types=[main_mod.VulnType.RCE],
+                context_code=[],
+            )
+
+    monkeypatch.setattr(main_mod, "_get_semgrep_candidates", lambda p: [fake_candidate])
+    monkeypatch.setattr(main_mod, "initialize_llm", lambda *a, **kw: PromptCaptureLLM())
+    monkeypatch.setattr(main_mod, "print_readable", lambda r: None)
+    monkeypatch.setattr(sys, "argv", ["vulnhuntr", "-r", str(repo_root), "--semgrep"])
+
+    main_mod.run()
+
+    # The Candidate's enclosing_source must appear in the secondary-loop prompt
+    assert any("SEMGREP_SEEDED_CONTEXT" in p for p in captured_prompts)
+
+
+def test_semgrep_flag_off_uses_original_flow(make_repo, monkeypatch):
+    repo_root = make_repo(
+        {
+            "README.md": "# Demo\n",
+            "app.py": '''
+                from flask import Flask
+
+                app = Flask(__name__)
+
+                @app.route("/ping")
+                def ping():
+                    return "ok"
+            ''',
+        }
+    )
+
+    analysis_call_count = [0]
+    semgrep_called = [False]
+
+    class CountingLLM:
+        def chat(self, prompt, response_model=None, max_tokens=4096):
+            if response_model is None:
+                return "<summary>test</summary>"
+            analysis_call_count[0] += 1
+            return main_mod.Response(
+                scratchpad="s", analysis="s", poc="None",
+                confidence_score=0, vulnerability_types=[], context_code=[],
+            )
+
+    monkeypatch.setattr(main_mod, "initialize_llm", lambda *a, **kw: CountingLLM())
+    monkeypatch.setattr(main_mod, "print_readable", lambda r: None)
+    monkeypatch.setattr(
+        main_mod, "_get_semgrep_candidates",
+        lambda p: (semgrep_called.__setitem__(0, True) or []),
+    )
+    monkeypatch.setattr(sys, "argv", ["vulnhuntr", "-r", str(repo_root)])
+
+    main_mod.run()
+
+    assert analysis_call_count[0] >= 1   # initial analysis ran
+    assert not semgrep_called[0]          # semgrep path was not taken
+
+
 def test_bypass_list_no_concat_bug():
     bypasses = prompts.VULN_SPECIFIC_BYPASSES_AND_PROMPTS["LFI"]["bypasses"]
 
