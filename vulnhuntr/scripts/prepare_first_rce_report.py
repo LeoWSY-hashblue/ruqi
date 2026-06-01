@@ -67,7 +67,7 @@ def render_report(
 ) -> str:
     rce_candidates = [candidate for candidate in candidates if candidate.sink_type == "rce"]
     lines = [
-        "# First RCE Candidate Report",
+        "# RCE Candidate Inventory",
         "",
         "This report is a reproducible candidate inventory. Findings are unconfirmed until verifier execution succeeds.",
         "",
@@ -123,7 +123,7 @@ def prepare_report(target_repo: Path, output_path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare a first RCE candidate report without LLM or verifier execution.")
+    parser = argparse.ArgumentParser(description="Prepare an RCE candidate inventory without LLM or verifier execution.")
     parser.add_argument("--target-repo", type=Path, required=True, help="Path to the target repository")
     parser.add_argument("--output", type=Path, required=True, help="Markdown report output path")
     args = parser.parse_args()
