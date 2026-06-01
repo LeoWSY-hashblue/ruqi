@@ -22,7 +22,7 @@ structlog.configure(
         structlog.processors.JSONRenderer()
     ],
     logger_factory=structlog.WriteLoggerFactory(
-        file=Path('vulnhuntr').with_suffix(".log").open("wt")
+        file=Path('vulnhuntr').with_suffix(".log").open("wt", encoding='utf-8')
     )
 )
 
