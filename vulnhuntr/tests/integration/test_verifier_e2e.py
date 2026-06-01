@@ -1,16 +1,17 @@
 """
-End-to-end verifier tests using the vulnerable_flask_app fixture.
+End-to-end verifier tests using the vulnerable stdlib HTTP fixture.
 
 Requires a running Docker daemon. Skipped automatically if Docker is unavailable.
 
 Flow:
-    1. Build vulnerable_flask_app image (cached after first run).
+    1. Build the fixture image (cached after first run).
     2. Start container (detached, --rm).
-    3. Wait for Flask /health to respond.
-    4. Run verify() with a real canary + real PoC.
+    3. Wait for /health to respond.
+    4. Run verify() with a real canary and real PoC.
     5. Assert verdict; tear down container.
 """
 
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -21,8 +22,8 @@ from vulnhuntr.candidate import Candidate
 from vulnhuntr.verifier import verify
 
 _FIXTURE_DIR = Path(__file__).parent.parent / "fixtures" / "vulnerable_flask_app"
-_IMAGE_TAG = "vulnhuntr-test-flask-rce:latest"
-_FLASK_URL = "http://127.0.0.1:5000"
+_IMAGE_TAG = "vulnhuntr-test-stdlib-rce:latest"
+_APP_URL = "http://127.0.0.1:5000"
 
 
 # ---------------------------------------------------------------------------
@@ -31,24 +32,52 @@ _FLASK_URL = "http://127.0.0.1:5000"
 
 def _docker_available() -> bool:
     try:
-        r = subprocess.run(["docker", "info"], capture_output=True, timeout=5)
-        return r.returncode == 0
+        result = subprocess.run(["docker", "info"], capture_output=True, timeout=5)
+        return result.returncode == 0
     except Exception:
         return False
 
 
 def _exec_in(container_id: str, cmd: list[str]) -> tuple[int, str]:
-    r = subprocess.run(
+    result = subprocess.run(
         ["docker", "exec", container_id, *cmd],
-        capture_output=True, text=True, timeout=15,
+        capture_output=True,
+        text=True,
+        timeout=15,
     )
-    return r.returncode, r.stdout + r.stderr
+    return result.returncode, result.stdout + result.stderr
 
 
-def _wait_for_flask(container_id: str, timeout: float = 20.0) -> bool:
+def _urlopen_command(url: str) -> list[str]:
+    code = (
+        "import urllib.request; "
+        f"urllib.request.urlopen({url!r}, timeout=5).read()"
+    )
+    return ["python", "-c", code]
+
+
+def _poc_for_compile(command_expr: str) -> str:
+    code = (
+        "import os, urllib.parse, urllib.request; "
+        f"cmd = {command_expr}; "
+        f"url = {_APP_URL!r} + '/compile?' + urllib.parse.urlencode({{'cmd': cmd}}); "
+        "urllib.request.urlopen(url, timeout=5).read()"
+    )
+    return "python -c " + shlex.quote(code)
+
+
+def _bad_endpoint_poc() -> str:
+    code = (
+        "import urllib.request; "
+        f"urllib.request.urlopen({_APP_URL + '/nonexistent_route_404'!r}, timeout=5).read()"
+    )
+    return "python -c " + shlex.quote(code)
+
+
+def _wait_for_app(container_id: str, timeout: float = 20.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        rc, _ = _exec_in(container_id, ["curl", "-sf", f"{_FLASK_URL}/health"])
+        rc, _ = _exec_in(container_id, _urlopen_command(f"{_APP_URL}/health"))
         if rc == 0:
             return True
         time.sleep(0.4)
@@ -58,45 +87,46 @@ def _wait_for_flask(container_id: str, timeout: float = 20.0) -> bool:
 def _rce_candidate() -> Candidate:
     return Candidate(
         file="app.py",
-        line=17,  # subprocess.run line
+        line=24,
         sink_type="rce",
         semgrep_rule_id="python.lang.security.audit.subprocess-shell-true.subprocess-shell-true",
-        code_snippet='subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)',
-        enclosing_symbol="compile_latex",
+        code_snippet="subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)",
+        enclosing_symbol="do_GET",
         enclosing_source=(
-            'def compile_latex():\n'
-            '    cmd = request.args.get("cmd", "echo noop")\n'
-            '    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)\n'
-            '    return result.stdout or result.stderr'
+            "def do_GET(self):\n"
+            "    cmd = parse_qs(parsed.query).get('cmd', ['echo noop'])[0]\n"
+            "    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)\n"
+            "    self._send(200, result.stdout or result.stderr)"
         ),
     )
 
 
 # ---------------------------------------------------------------------------
-# Module-scoped fixture: one container for all tests in this file
+# Module-scoped fixture: one non-root container for all tests in this file
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
-def flask_rce_container():
+def rce_container():
     if not _docker_available():
-        pytest.skip("Docker daemon not reachable — skipping verifier e2e tests")
+        pytest.skip("Docker daemon not reachable - skipping verifier e2e tests")
 
-    # Build (cached by Docker layer hash; fast on repeat runs)
     subprocess.run(
         ["docker", "build", "-t", _IMAGE_TAG, str(_FIXTURE_DIR)],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
 
-    # Start container
-    r = subprocess.run(
+    result = subprocess.run(
         ["docker", "run", "-d", "--rm", _IMAGE_TAG],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    container_id = r.stdout.strip()
+    container_id = result.stdout.strip()
 
-    if not _wait_for_flask(container_id):
+    if not _wait_for_app(container_id):
         subprocess.run(["docker", "stop", container_id], capture_output=True)
-        pytest.fail("Flask app did not become ready within 20 s")
+        pytest.fail("Fixture app did not become ready within 20 s")
 
     yield container_id
 
@@ -107,17 +137,13 @@ def flask_rce_container():
 # Tests
 # ---------------------------------------------------------------------------
 
-def test_rce_confirmed_canary_deleted(flask_rce_container):
+def test_rce_confirmed_canary_deleted(rce_container):
     """
-    PoC routes cmd=rm $CANARY_PATH through the vulnerable /compile endpoint.
-    Flask runs it via subprocess(shell=True).
-    Verifier detects canary deletion → confirmed.
+    PoC routes cmd=rm $CANARY_PATH through /compile.
+    The non-root app process deletes the canary, so verifier returns confirmed.
     """
-    poc = (
-        f'curl -s --get --data-urlencode "cmd=rm ${{CANARY_PATH}}"'
-        f' {_FLASK_URL}/compile'
-    )
-    result = verify(_rce_candidate(), flask_rce_container, poc)
+    poc = _poc_for_compile("'rm ' + os.environ['CANARY_PATH']")
+    result = verify(_rce_candidate(), rce_container, poc)
 
     assert result.status == "confirmed", (
         f"Expected confirmed but got {result.status!r}: {result.evidence}"
@@ -125,16 +151,12 @@ def test_rce_confirmed_canary_deleted(flask_rce_container):
     assert "deleted" in result.evidence
 
 
-def test_rce_canary_modified_via_write(flask_rce_container):
+def test_rce_canary_modified_via_write(rce_container):
     """
-    PoC writes a new value into the canary file instead of deleting it.
-    Verifier detects content change → confirmed.
+    PoC writes a new value into the canary from the non-root app process.
     """
-    poc = (
-        f'curl -s --get --data-urlencode "cmd=echo PWNED > ${{CANARY_PATH}}"'
-        f' {_FLASK_URL}/compile'
-    )
-    result = verify(_rce_candidate(), flask_rce_container, poc)
+    poc = _poc_for_compile("'echo PWNED > ' + os.environ['CANARY_PATH']")
+    result = verify(_rce_candidate(), rce_container, poc)
 
     assert result.status == "confirmed", (
         f"Expected confirmed but got {result.status!r}: {result.evidence}"
@@ -142,26 +164,23 @@ def test_rce_canary_modified_via_write(flask_rce_container):
     assert "modified" in result.evidence
 
 
-def test_safe_poc_yields_suspected(flask_rce_container):
+def test_safe_poc_yields_suspected(rce_container):
     """
-    PoC reaches the server but asks it to run 'echo noop' — canary untouched.
-    Verifier returns suspected (PoC ran OK, no evidence of exploitation).
+    PoC reaches the server but asks it to run echo noop; canary is untouched.
     """
-    poc = f'curl -s "{_FLASK_URL}/compile?cmd=echo+noop"'
-    result = verify(_rce_candidate(), flask_rce_container, poc)
+    poc = _poc_for_compile("'echo noop'")
+    result = verify(_rce_candidate(), rce_container, poc)
 
     assert result.status == "suspected", (
         f"Expected suspected but got {result.status!r}: {result.evidence}"
     )
 
 
-def test_bad_endpoint_yields_false_positive(flask_rce_container):
+def test_bad_endpoint_yields_false_positive(rce_container):
     """
-    PoC hits a non-existent endpoint → curl exits non-zero, canary untouched.
-    Verifier returns false_positive.
+    PoC hits a non-existent endpoint; urllib exits non-zero, canary is untouched.
     """
-    poc = f'curl -sf "{_FLASK_URL}/nonexistent_route_404"'
-    result = verify(_rce_candidate(), flask_rce_container, poc)
+    result = verify(_rce_candidate(), rce_container, _bad_endpoint_poc())
 
     assert result.status == "false_positive", (
         f"Expected false_positive but got {result.status!r}: {result.evidence}"

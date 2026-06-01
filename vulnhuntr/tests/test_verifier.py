@@ -1,16 +1,16 @@
 """
-Tests for vulnhuntr.verifier — all tests use mocked docker exec calls,
-no real Docker daemon required.
+Tests for vulnhuntr.verifier. All tests use mocked docker exec calls,
+so no real Docker daemon is required.
 """
 
+import re
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from vulnhuntr.candidate import Candidate
 from vulnhuntr import verifier as verifier_mod
-from vulnhuntr.verifier import VerifyResult, verify
+from vulnhuntr.candidate import Candidate
+from vulnhuntr.verifier import verify
 
 
 # ---------------------------------------------------------------------------
@@ -31,45 +31,44 @@ def _make_rce_candidate(**kwargs) -> Candidate:
     return Candidate(**defaults)
 
 
-def _make_exec_results(*return_values):
-    """
-    Return a side_effect list for _docker_exec mock.
-    Each element is (returncode, stdout, stderr).
-    """
-    return list(return_values)
-
-
 CANARY_CONTENT = "VULNHUNTR_CANARY_UNTOUCHED"
+
+
+def _patch_uuid(monkeypatch, value: str) -> str:
+    monkeypatch.setattr(verifier_mod.uuid, "uuid4", lambda: SimpleNamespace(hex=value))
+    return f"/tmp/vulnhuntr_canary_{value}/canary"
 
 
 # ---------------------------------------------------------------------------
 # test_verify_confirmed_by_deletion
-#   PoC deletes the canary → status = confirmed
+#   PoC deletes the canary -> status = confirmed
 # ---------------------------------------------------------------------------
 
 def test_verify_confirmed_by_deletion(monkeypatch):
-    canary_path = "/tmp/canary_abc123"
+    canary_path = _patch_uuid(monkeypatch, "abc123")
+    calls = []
 
-    # Sequence of _docker_exec calls:
-    #   1. plant canary (sh -c echo ... > canary && chmod 444 canary)  → rc=0
-    #   2. read canary before PoC (cat)                                → rc=0, content
-    #   3. execute PoC                                                 → rc=0
-    #   4. read canary after PoC (cat)                                 → rc=1, ""  (deleted)
     exec_results = [
         (0, "", ""),                          # plant
         (0, CANARY_CONTENT + "\n", ""),       # read before
         (0, "", ""),                          # poc exec
-        (1, "", "No such file"),              # read after (deleted)
+        (42, "", "No such file"),             # read after (deleted)
     ]
     call_iter = iter(exec_results)
-    monkeypatch.setattr(verifier_mod, "_docker_exec", lambda cid, cmd: next(call_iter))
 
-    # Force a deterministic canary path
-    monkeypatch.setattr(verifier_mod.uuid, "uuid4", lambda: SimpleNamespace(hex="abc123"))
+    def fake_exec(cid, cmd):
+        calls.append((cid, cmd))
+        return next(call_iter)
+
+    monkeypatch.setattr(verifier_mod, "_docker_exec", fake_exec)
 
     candidate = _make_rce_candidate()
     result = verify(candidate, "fake_container", "rm $CANARY_PATH")
 
+    plant_cmd = calls[0][1][2]
+    assert "chmod 444" not in plant_cmd
+    assert "chmod 777 /tmp/vulnhuntr_canary_abc123" in plant_cmd
+    assert "chmod 666 /tmp/vulnhuntr_canary_abc123/canary" in plant_cmd
     assert result.status == "confirmed"
     assert "deleted" in result.evidence
     assert result.canary_path == canary_path
@@ -77,11 +76,11 @@ def test_verify_confirmed_by_deletion(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # test_verify_confirmed_by_modification
-#   PoC modifies canary content → status = confirmed
+#   PoC modifies canary content -> status = confirmed
 # ---------------------------------------------------------------------------
 
 def test_verify_confirmed_by_modification(monkeypatch):
-    canary_path = "/tmp/canary_def456"
+    _patch_uuid(monkeypatch, "def456")
 
     exec_results = [
         (0, "", ""),                          # plant
@@ -91,7 +90,6 @@ def test_verify_confirmed_by_modification(monkeypatch):
     ]
     call_iter = iter(exec_results)
     monkeypatch.setattr(verifier_mod, "_docker_exec", lambda cid, cmd: next(call_iter))
-    monkeypatch.setattr(verifier_mod.uuid, "uuid4", lambda: SimpleNamespace(hex="def456"))
 
     candidate = _make_rce_candidate()
     result = verify(candidate, "fake_container", "echo PWNED > $CANARY_PATH")
@@ -102,21 +100,20 @@ def test_verify_confirmed_by_modification(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # test_verify_false_positive_on_poc_error
-#   PoC exits non-zero and canary unchanged → false_positive
+#   PoC exits non-zero and canary unchanged -> false_positive
 # ---------------------------------------------------------------------------
 
 def test_verify_false_positive_on_poc_error(monkeypatch):
-    canary_path = "/tmp/canary_ghi789"
+    _patch_uuid(monkeypatch, "ghi789")
 
     exec_results = [
         (0, "", ""),                          # plant
         (0, CANARY_CONTENT + "\n", ""),       # read before
-        (1, "", "command not found"),          # poc fails
+        (1, "", "command not found"),         # poc fails
         (0, CANARY_CONTENT + "\n", ""),       # read after (unchanged)
     ]
     call_iter = iter(exec_results)
     monkeypatch.setattr(verifier_mod, "_docker_exec", lambda cid, cmd: next(call_iter))
-    monkeypatch.setattr(verifier_mod.uuid, "uuid4", lambda: SimpleNamespace(hex="ghi789"))
 
     candidate = _make_rce_candidate()
     result = verify(candidate, "fake_container", "bad_command $CANARY_PATH")
@@ -127,11 +124,11 @@ def test_verify_false_positive_on_poc_error(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # test_verify_suspected_when_poc_runs_but_canary_unchanged
-#   PoC exits 0 but canary untouched → suspected
+#   PoC exits 0 but canary untouched -> suspected
 # ---------------------------------------------------------------------------
 
 def test_verify_suspected_when_poc_runs_but_canary_unchanged(monkeypatch):
-    canary_path = "/tmp/canary_jkl012"
+    _patch_uuid(monkeypatch, "jkl012")
 
     exec_results = [
         (0, "", ""),                          # plant
@@ -141,10 +138,9 @@ def test_verify_suspected_when_poc_runs_but_canary_unchanged(monkeypatch):
     ]
     call_iter = iter(exec_results)
     monkeypatch.setattr(verifier_mod, "_docker_exec", lambda cid, cmd: next(call_iter))
-    monkeypatch.setattr(verifier_mod.uuid, "uuid4", lambda: SimpleNamespace(hex="jkl012"))
 
     candidate = _make_rce_candidate()
-    result = verify(candidate, "fake_container", "echo hello")   # doesn't touch canary
+    result = verify(candidate, "fake_container", "echo hello")
 
     assert result.status == "suspected"
     assert "not modified" in result.evidence
@@ -171,17 +167,15 @@ def test_canary_path_is_unique_per_call(monkeypatch):
     call_counter = [0]
 
     def fake_exec(cid, cmd):
-        # Track plant calls to capture canary paths
-        c = " ".join(cmd)
-        if "VULNHUNTR_CANARY" in c and "echo" in c:
-            import re
-            m = re.search(r"/tmp/canary_\w+", c)
-            if m:
-                paths_seen.append(m.group(0))
-        if "cat" in c:
+        command = " ".join(cmd)
+        if "VULNHUNTR_CANARY" in command and "printf" in command:
+            match = re.search(r"/tmp/vulnhuntr_canary_\w+/canary", command)
+            if match:
+                paths_seen.append(match.group(0))
+        if "cat" in command:
             call_counter[0] += 1
-            # Alternating: first read returns content, second read returns deleted
-            return (0, CANARY_CONTENT + "\n", "") if call_counter[0] % 2 == 1 else (1, "", "")
+            # Alternating: first read returns content, second read returns deleted.
+            return (0, CANARY_CONTENT + "\n", "") if call_counter[0] % 2 == 1 else (42, "", "")
         return (0, "", "")
 
     monkeypatch.setattr(verifier_mod, "_docker_exec", fake_exec)
@@ -191,3 +185,4 @@ def test_canary_path_is_unique_per_call(monkeypatch):
     r2 = verify(candidate, "c1", "rm $CANARY_PATH")
 
     assert r1.canary_path != r2.canary_path
+    assert paths_seen == [r1.canary_path, r2.canary_path]

@@ -1,19 +1,20 @@
 """
-Dynamic verification layer — RCE only (v1).
+Dynamic verification layer - RCE only (v1).
 
 Flow:
   1. Caller creates a Docker container with the target app.
   2. Caller calls verify(candidate, container_id, poc).
-  3. verifier pre-plants a canary file at /tmp/canary_<uuid> inside the container.
+  3. verifier pre-plants a canary file inside a world-writable container directory.
   4. verifier executes the PoC (a shell command) inside the container.
   5. Verdict is determined solely by whether the canary was modified/deleted.
-     LLM output is NOT used for verdict — only filesystem evidence.
+     LLM output is NOT used for verdict - only filesystem evidence.
 
 Only RCE sink_type is handled. Other types raise NotImplementedError (v2).
 """
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -29,7 +30,7 @@ from vulnhuntr.candidate import Candidate
 class VerifyResult:
     status: str          # "confirmed" | "suspected" | "false_positive"
     evidence: str        # human-readable description of what was observed
-    canary_path: str     # /tmp/canary_<uuid> that was planted
+    canary_path: str     # /tmp/vulnhuntr_canary_<uuid>/canary that was planted
 
 
 # ---------------------------------------------------------------------------
@@ -52,12 +53,23 @@ def _docker_exec(container_id: str, cmd: list[str]) -> tuple[int, str, str]:
 
 def _plant_canary(container_id: str) -> str:
     """
-    Create /tmp/canary_<uuid> inside the container and return its path.
-    The file contains a known sentinel so we can detect modification vs deletion.
+    Create a world-writable canary file inside the container and return its path.
+    The file lives in a world-writable directory so non-root processes can delete
+    it, and the file itself is world-writable so non-root processes can modify it.
     """
-    canary_path = f"/tmp/canary_{uuid.uuid4().hex}"
+    canary_dir = f"/tmp/vulnhuntr_canary_{uuid.uuid4().hex}"
+    canary_path = f"{canary_dir}/canary"
     sentinel = "VULNHUNTR_CANARY_UNTOUCHED"
-    rc, _, err = _docker_exec(container_id, ["sh", "-c", f"echo '{sentinel}' > {canary_path} && chmod 444 {canary_path}"])
+    canary_dir_q = shlex.quote(canary_dir)
+    canary_path_q = shlex.quote(canary_path)
+    sentinel_q = shlex.quote(sentinel)
+    plant_cmd = (
+        f"mkdir -p {canary_dir_q} && "
+        f"chmod 777 {canary_dir_q} && "
+        f"printf %s {sentinel_q} > {canary_path_q} && "
+        f"chmod 666 {canary_path_q}"
+    )
+    rc, _, err = _docker_exec(container_id, ["sh", "-c", plant_cmd])
     if rc != 0:
         raise RuntimeError(f"Failed to plant canary in {container_id}: {err.strip()}")
     return canary_path
@@ -67,8 +79,10 @@ def _read_canary(container_id: str, canary_path: str) -> tuple[bool, str]:
     """
     Return (exists, content).  content is "" if the file does not exist.
     """
-    rc, stdout, _ = _docker_exec(container_id, ["sh", "-c", f"cat {canary_path} 2>/dev/null"])
-    if rc != 0 or stdout.strip() == "":
+    canary_path_q = shlex.quote(canary_path)
+    read_cmd = f"if [ -e {canary_path_q} ]; then cat {canary_path_q}; else exit 42; fi"
+    rc, stdout, _ = _docker_exec(container_id, ["sh", "-c", read_cmd])
+    if rc != 0:
         return False, ""
     return True, stdout.strip()
 
@@ -95,7 +109,7 @@ def _determine_verdict(
     poc_stderr: str,
 ) -> VerifyResult:
     """
-    Determines verdict from canary state changes only — no LLM involvement.
+    Determines verdict from canary state changes only - no LLM involvement.
 
     confirmed      : canary was deleted OR its content changed
     suspected      : PoC ran without error but canary is unchanged
@@ -111,7 +125,7 @@ def _determine_verdict(
             canary_path=canary_path,
         )
 
-    # Canary deleted — unambiguous RCE evidence
+    # Canary deleted - unambiguous RCE evidence
     if not existed_after:
         return VerifyResult(
             status="confirmed",
@@ -119,7 +133,7 @@ def _determine_verdict(
             canary_path=canary_path,
         )
 
-    # Canary content changed — also strong evidence
+    # Canary content changed - also strong evidence
     if content_after != content_before:
         return VerifyResult(
             status="confirmed",
@@ -141,7 +155,7 @@ def _determine_verdict(
             canary_path=canary_path,
         )
 
-    # PoC ran OK but canary untouched — partial / needs refinement
+    # PoC ran OK but canary untouched - partial / needs refinement
     return VerifyResult(
         status="suspected",
         evidence=(
@@ -171,7 +185,7 @@ def verify(candidate: Candidate, container_id: str, poc: str) -> VerifyResult:
 
     Returns
     -------
-    VerifyResult with status ∈ {"confirmed", "suspected", "false_positive"}.
+    VerifyResult with status one of {"confirmed", "suspected", "false_positive"}.
 
     Raises
     ------
@@ -191,7 +205,7 @@ def verify(candidate: Candidate, container_id: str, poc: str) -> VerifyResult:
     existed_before, content_before = _read_canary(container_id, canary_path)
 
     # Inject canary path into PoC as env var so the PoC can reference it
-    poc_with_canary = f"export CANARY_PATH={canary_path}; {poc}"
+    poc_with_canary = f"export CANARY_PATH={shlex.quote(canary_path)}; {poc}"
     poc_rc, _poc_stdout, poc_stderr = _execute_poc(container_id, poc_with_canary)
 
     # Read final state
