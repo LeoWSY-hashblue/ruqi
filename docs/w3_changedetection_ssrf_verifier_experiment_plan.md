@@ -6,6 +6,9 @@
 - Target commit: `dd56a502c0b3d025a6a1d4e46942e9321b977bf8`
 - Verifier implementation: `vulnhuntr.ssrf_verifier.verify_ssrf`
 - Status: plan only. Do not run changedetection.io yet.
+- Phase 1 scope: implement and review `browser-redirect` only.
+- Deferred scope: `notification-redirect` remains blocked until UI route/session/CSRF
+  behavior and an accepted Apprise HTTP scheme are confirmed.
 
 ## Current Candidates
 
@@ -25,10 +28,17 @@ Before running any real target experiment, confirm:
   - whether UI auth is enabled.
   - whether API key access is enabled.
   - how to pass API key to watch/notification endpoints.
+  - API key source:
+    - UI: Settings > API.
+    - Fresh datastore: `settings.application.api_access_token` in the persisted
+      datastore, pending confirmation in the exact runtime.
 - Browser fetcher:
   - whether `html_webdriver` is available in the local runtime.
   - whether Playwright/Puppeteer/Selenium service is required.
   - how to create a watch using browser fetcher without relying on UI clicks.
+  - Docker Compose browser service requirements:
+    - set `PLAYWRIGHT_DRIVER_URL=ws://browser-sockpuppet-chrome:3000`.
+    - enable the `browser-sockpuppet-chrome` service.
 - Notification path:
   - exact API route and payload for notification URL configuration.
   - whether test notification can be triggered through API or only UI endpoint.
@@ -75,6 +85,11 @@ Subresource variant:
 
 Goal: test whether changedetection.io notification HTTP handlers follow redirects
 to a verifier canary endpoint without equivalent redirect-hop SSRF validation.
+
+Status: deferred. The UI send-test route is known, but session/CSRF handling and
+the exact Apprise HTTP scheme/payload for a deterministic local experiment are
+not yet confirmed. The runner must continue to exit with a clear not implemented
+message for `notification-redirect`.
 
 Setup:
 
