@@ -119,6 +119,38 @@ Recommended per-target notes:
 8. Enter verifier work only after static triage identifies a concrete route,
    user-controlled field, and sink argument preserving taint.
 
+## LLM Reconnaissance Track
+
+LLM reconnaissance is an optional static-review aid for targets where Semgrep
+intake is empty, noisy, or misses framework-specific dispatch behavior. It must
+not replace deterministic static triage or verifier work.
+
+LLM recon purpose:
+
+- Identify active HTTP/API/plugin entrypoints.
+- Find structural Semgrep blind spots such as SSRF dataflow, dispatch-table RCE,
+  IDOR, and path traversal patterns.
+- Suggest candidate source-to-sink paths for human triage.
+- Help prioritize which files and routes should be read next.
+
+LLM recon prohibitions:
+
+- Do not write `confirmed`.
+- Do not produce a CVE-ready conclusion.
+- Do not replace verifier or equivalent deterministic evidence.
+- Do not assume routes, parameters, permissions, or framework behavior not
+  present in the provided context.
+
+LLM recon output requirements:
+
+- Every suspected path must enter the static triage checklist before any deeper
+  work.
+- Classifications are limited to `recon candidate`, `needs static check`, or
+  `likely irrelevant`.
+- Missing context must be listed explicitly.
+- Dynamic verification remains `Not run` until the verifier is intentionally
+  invoked in a later phase.
+
 ## W3 Completion Criteria
 
 - 5-10 targets reviewed with reproducible triage notes.
