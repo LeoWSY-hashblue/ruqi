@@ -34,6 +34,7 @@ class CallbackHit:
 class CallbackServer:
     host: str = "127.0.0.1"
     port: int = 0
+    public_host: str | None = None
     _server: ThreadingHTTPServer | None = field(default=None, init=False, repr=False)
     _thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -51,6 +52,8 @@ class CallbackServer:
         if self._server is None:
             raise RuntimeError("Callback server is not running")
         host, port = self._server.server_address
+        if self.public_host:
+            host = self.public_host
         return f"http://{host}:{port}"
 
     def start(self) -> None:
@@ -153,10 +156,10 @@ def verify_ssrf(
         )
 
     token = uuid.uuid4().hex
-    owns_server = callback_server is None
     server = callback_server or CallbackServer()
+    started_server = server._server is None
 
-    if owns_server:
+    if started_server:
         server.start()
 
     try:
@@ -195,5 +198,5 @@ def verify_ssrf(
             canary_path=canary_url,
         )
     finally:
-        if owns_server:
+        if started_server:
             server.stop()

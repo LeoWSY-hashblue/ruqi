@@ -11,7 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from vulnhuntr.candidate import Candidate
-from vulnhuntr.ssrf_verifier import verify_ssrf
+from vulnhuntr.ssrf_verifier import CallbackServer, verify_ssrf
 
 
 MODES = ("browser-redirect", "notification-redirect")
@@ -37,6 +37,16 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--no-cleanup", dest="cleanup", action="store_false", help="Leave the created watch in place.")
     parser.set_defaults(cleanup=True)
     parser.add_argument("--timeout", type=float, default=5.0, help="Callback wait timeout in seconds.")
+    parser.add_argument(
+        "--callback-bind-host",
+        default="127.0.0.1",
+        help="Local interface for the verifier callback server.",
+    )
+    parser.add_argument(
+        "--callback-public-host",
+        default=None,
+        help="Host/IP the target should use to reach the callback server, e.g. host.docker.internal.",
+    )
     return parser
 
 
@@ -130,8 +140,9 @@ def poc_for_mode(mode: str):
     raise ValueError(f"Unsupported mode: {mode}")
 
 
-def print_browser_redirect_dry_run(target_base_url: str, cleanup: bool) -> None:
-    redirect_url = "http://127.0.0.1:<callback-port>/redirect/<token>?to=http%3A%2F%2F127.0.0.1%3A<callback-port>%2Fcanary%2F<token>"
+def print_browser_redirect_dry_run(target_base_url: str, cleanup: bool, callback_public_host: str | None) -> None:
+    callback_host = callback_public_host or "127.0.0.1"
+    redirect_url = f"http://{callback_host}:<callback-port>/redirect/<token>?to=http%3A%2F%2F{callback_host}%3A<callback-port>%2Fcanary%2F<token>"
     payload = build_browser_redirect_payload(redirect_url)
     print("Dry run: no target requests will be sent and no callback server will be started.")
     print("Planned calls:")
@@ -158,12 +169,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.dry_run:
-        print_browser_redirect_dry_run(args.target_base_url, args.cleanup)
+        print_browser_redirect_dry_run(args.target_base_url, args.cleanup, args.callback_public_host)
         return 0
 
     candidate = make_candidate(args.mode)
     poc = make_browser_redirect_poc(api_key, cleanup=args.cleanup)
-    result = verify_ssrf(candidate, args.target_base_url, poc, wait_timeout=args.timeout)
+    callback_server = CallbackServer(host=args.callback_bind_host, public_host=args.callback_public_host)
+    result = verify_ssrf(candidate, args.target_base_url, poc, callback_server=callback_server, wait_timeout=args.timeout)
     print(result.status)
     print(result.evidence)
     return 2 if result.status == "false_positive" else 0

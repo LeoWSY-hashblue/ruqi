@@ -39,6 +39,11 @@ def test_redirect_url_encodes_complex_target_url():
     assert parse_qs(parsed.query)["to"] == [target_url]
 
 
+def test_callback_server_can_advertise_public_host():
+    with CallbackServer(host="127.0.0.1", public_host="host.docker.internal") as server:
+        assert server.base_url.startswith("http://host.docker.internal:")
+
+
 def test_verify_ssrf_confirmed_by_direct_callback():
     def poc(target_base_url, callback_url, redirect_url):
         assert target_base_url == "http://target.local"

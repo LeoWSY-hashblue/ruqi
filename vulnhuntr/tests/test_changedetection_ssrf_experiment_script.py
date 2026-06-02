@@ -27,6 +27,8 @@ def test_script_exposes_parser_main_and_modes():
     assert "--cleanup" in help_text
     assert "--no-cleanup" in help_text
     assert "--timeout" in help_text
+    assert "--callback-bind-host" in help_text
+    assert "--callback-public-host" in help_text
 
 
 def test_script_contains_no_real_metadata_targets():
@@ -53,6 +55,8 @@ def test_dry_run_does_not_send_network_requests(monkeypatch, capsys):
             "browser-redirect",
             "--api-key",
             "dummy",
+            "--callback-public-host",
+            "host.docker.internal",
             "--dry-run",
         ]
     )
@@ -64,6 +68,7 @@ def test_dry_run_does_not_send_network_requests(monkeypatch, capsys):
     assert "GET <target-base-url>/api/v1/watch/<uuid>?recheck=true" in output
     assert "DELETE <target-base-url>/api/v1/watch/<uuid>" in output
     assert "html_webdriver" in output
+    assert "host.docker.internal" in output
 
 
 def test_missing_api_key_returns_clear_error(monkeypatch, capsys):
